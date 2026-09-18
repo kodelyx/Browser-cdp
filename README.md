@@ -2,11 +2,7 @@
 
 A generic, project-agnostic Chrome DevTools Protocol bridge.
 
-This is a slimmed-down, de-branded descendant of the Weavy extension bridge. All
-Weavy-specific logic (flow IDs, node catalogs, `.react-flow` selectors, dashboard
-automation, the "Create New File" click) has been removed. What remains is the
-part that is genuinely reusable: **attach to a tab, send CDP commands, stream CDP
-events, and read cookies — scoped to a configured allowlist.**
+**browser-Cdp** is a lightweight, general-purpose Chrome DevTools Protocol (CDP) bridge extension. It provides core capabilities to **attach to a tab, send CDP commands, stream CDP events, and read cookies — with optional configurable allowlists.**
 
 It is a drop-in alternative to launching Chrome with
 `--remote-debugging-port=9222`, with two advantages: the browser stays your normal
@@ -190,8 +186,8 @@ Scope, when you configure it, is enforced in code:
 - **Raw CDP cookie methods can be denied** via `blockedMethods`. This matters:
   without a deny-list, a caller can attach to an allowed tab and then issue
   `Network.getAllCookies`, which returns every cookie in the profile. The tab
-  allowlist limits which tab you attach to, not which method you then run. The
-  flow-go backend pushes a 15-entry deny-list for exactly this reason.
+  allowlist limits which tab you attach to, not which method you then run. Backends
+  can push a deny-list for exactly this reason.
 - **Tab allowlist is enforced on every attach** when `targetUrlPrefixes` is
   non-empty, including attaches triggered indirectly by `cdp.call` /
   `cdp.evaluate`.
@@ -201,21 +197,6 @@ Scope, when you configure it, is enforced in code:
 - **No remote code.** The extension is plain MV3 JavaScript, no WASM, no eval of
   backend-supplied code — `cdp.evaluate` is the one deliberate exception, and it
   runs inside the attached tab.
-
-## Differences from the Weavy bridge
-
-| | Weavy `extension/` | `browser-Cdp/` |
-| --- | --- | --- |
-| Target site | hardcoded `app.weavy.ai` | configurable allowlist |
-| Cookie scope | hardcoded `weavy.ai` | configurable allowlist |
-| Domain logic | flow ensure/create/remember, canvas waits | none |
-| Config | constants in `bridge.js` | `chrome.storage.local` + `config.set` |
-| Operations | `flow.*` ops | `tab.*` + `cdp.*` + `cookies.*` only |
-| Reusable in another project | no | yes |
-
-If you need Weavy behaviour on top of this, keep it in your backend: use
-`cdp.evaluate` to click the button and read the resulting URL. The transport no
-longer needs to know what a "flow" is.
 
 ## Limitations
 

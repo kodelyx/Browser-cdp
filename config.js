@@ -2,8 +2,8 @@
  * browser-Cdp - configuration.
  *
  * Everything a host project would otherwise hardcode lives here, so the same
- * extension binary can serve Flow, Weavy, Gemini, or anything else that speaks
- * CDP. Values are persisted in chrome.storage.local and can be overwritten at
+ * extension binary can serve any local agent or backend that speaks CDP.
+ * Values are persisted in chrome.storage.local and can be overwritten at
  * runtime by the backend via the `config.set` bridge operation.
  *
  * Nothing in this file is project specific. The defaults are intentionally

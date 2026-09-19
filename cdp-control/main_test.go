@@ -78,8 +78,8 @@ func TestStatusNamesTheFixWhenNothingIsAttached(t *testing.T) {
 	if hint == "" {
 		t.Error("the unattached status must say what to do about it")
 	}
-	if !strings.Contains(hint, "browser-Cdp") {
-		t.Errorf("the hint must name the extension to load, got %q", hint)
+	if !strings.Contains(hint, "extension") {
+		t.Errorf("the hint must name the folder to load, got %q", hint)
 	}
 }
 

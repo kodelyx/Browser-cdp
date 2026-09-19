@@ -121,7 +121,7 @@ type server struct {
 func (s *server) client() (*cdp.Client, error) {
 	client := s.bridge.Current()
 	if client == nil || !client.Connected() {
-		return nil, fmt.Errorf("no extension attached — load ../browser-Cdp in Chrome " +
+		return nil, fmt.Errorf("no extension attached — load ../extension in Chrome " +
 			"and point it at this bridge's address")
 	}
 	return client, nil
@@ -440,7 +440,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	if client == nil || !client.Connected() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"attached": false,
-			"hint": "load ../browser-Cdp in Chrome, then set its Backend bridge field to " +
+			"hint": "load ../extension in Chrome, then set its Backend bridge field to " +
 				"this tool's address",
 		})
 		return

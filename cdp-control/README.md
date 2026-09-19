@@ -21,7 +21,7 @@ The default WebSocket port is 9222 because that is the extension's own default, 
 nothing in the browser needs configuring. The Flow engine also uses 9222 — run one at
 a time, or move this one with `-ws`.
 
-Load `../browser-Cdp` as an unpacked extension in Chrome. It dials out; there is
+Load `../extension` as an unpacked extension in Chrome. It dials out; there is
 nothing to point at it.
 
 ## Endpoints

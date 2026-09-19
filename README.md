@@ -41,6 +41,7 @@ extension -> you : {"event": "cdp.event", "params": {...}}
 | `config.reset` | — | defaults |
 | `tabs.list` | — | allowed tabs only |
 | `tabs.open` | `{url, active}` | `{tabId, url, title}` |
+| `tabs.navigate` | `{url}` | `{tabId, url, title}` (reuses tab) |
 | `tab.attach` | `{tabId?}` | `{tabId, url, title}` |
 | `tab.detach` | — | `{detached}` |
 | `tab.current` | — | `{tabId, url, title}` or `null` |

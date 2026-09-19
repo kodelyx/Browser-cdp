@@ -117,6 +117,7 @@ extension -> you : {"event": "<name>", "params": { ... }}     // unsolicited
   lines.push('| `config.reset` | — | defaults |');
   lines.push('| `tabs.list` | — | allowed tabs only |');
   lines.push('| `tabs.open` | `{url, active}` | `{tabId, url, title}` |');
+  lines.push('| `tabs.navigate` | `{url}` | `{tabId, url, title}` |');
   lines.push('| `tab.attach` | `{tabId?}` | `{tabId, url, title}` |');
   lines.push('| `tab.detach` | — | `{detached}` |');
   lines.push('| `tab.current` | — | `{tabId, url, title}` or `null` |');

@@ -29,7 +29,8 @@
  *   config.set   {patch}          -> updated config (reconnects if bridgeUrl changed)
  *   config.reset                  -> defaults
  *   tabs.list                     -> [{id,url,title,active,windowId}]
- *   tabs.open    {url,active}     -> {tabId,url,title}
+ *   tabs.open    {url,active}     -> {tabId,url,title}   (always creates)
+ *   tabs.navigate {url}           -> {tabId,url,title}   (reuses a tab)
  *   tab.attach   {tabId?}         -> {tabId,url,title}
  *   tab.detach                    -> {detached:true}
  *   tab.current                   -> {tabId,url,title} | null
@@ -381,6 +382,39 @@ async function handle(message) {
         }
         const created = await chrome.tabs.create({url, active: params.active !== false});
         if (!created?.id) throw new Error('Could not open tab');
+        const tab = await waitForTab(created.id, (item) => urlAllowed(item.url, config), 45000, url);
+        result = {tabId: tab.id, url: tab.url, title: tab.title || null};
+        break;
+      }
+
+      case 'tabs.navigate': {
+        await ensureConfig();
+        const url = String(params.url || '');
+        if (!urlAllowed(url, config)) {
+          throw new Error(`Refusing to navigate to a URL outside the allowlist: ${url}`);
+        }
+
+        // Reuse a tab instead of opening another one.
+        //
+        // tabs.open always creates, and the engine navigates repeatedly — once
+        // per account switch and once per project — so creating each time fills
+        // the window with Flow tabs and eventually hangs the browser.
+        let targetId = attachedTabId;
+        if (targetId === null) {
+          const existing = await resolveTab(null).catch(() => null);
+          targetId = existing?.id ?? null;
+        }
+
+        if (targetId !== null) {
+          await chrome.tabs.update(targetId, {url});
+          const tab = await waitForTab(targetId, (item) => urlAllowed(item.url, config), 45000, url);
+          result = {tabId: tab.id, url: tab.url, title: tab.title || null};
+          break;
+        }
+
+        // Nothing to reuse — behave exactly like tabs.open.
+        const created = await chrome.tabs.create({url, active: params.active !== false});
+        if (!created?.id) throw new Error('Could not navigate or open a tab');
         const tab = await waitForTab(created.id, (item) => urlAllowed(item.url, config), 45000, url);
         result = {tabId: tab.id, url: tab.url, title: tab.title || null};
         break;

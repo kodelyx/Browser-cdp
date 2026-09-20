@@ -12,14 +12,18 @@ nothing else attached.
 
 ```bash
 go build -o cdp-control .
-./cdp-control                       # ws 9222, http 8201
-./cdp-control -ws 127.0.0.1:9223    # when the Flow engine also holds 9222
+./cdp-control                       # ws 9223, http 8201
+./cdp-control -ws 127.0.0.1:9222    # when nothing else holds it
 ./cdp-control -http 127.0.0.1:8301  # when 8201 is taken
 ```
 
-The default WebSocket port is 9222 because that is the extension's own default, so
-nothing in the browser needs configuring. The Flow engine also uses 9222 — run one at
-a time, or move this one with `-ws`.
+The default WebSocket port is **9223**, not the extension's own 9222, so this can run
+alongside a product that drives the same extension. Both listen for a WebSocket and
+both extensions dial 9222 by default, so sharing the port means whichever connects
+first wins and the other silently gets the wrong bridge.
+
+Point the extension you use for debugging at `ws://127.0.0.1:9223` — one line in its
+`config.js` — and leave the other where it is.
 
 Load `../extension` as an unpacked extension in Chrome. It dials out; there is
 nothing to point at it.

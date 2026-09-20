@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/kodelyx/cdp-control/bridge"
+	"github.com/kodelyx/cdp-control/cdp"
 )
 
 // newTestServer builds the API with a bridge and nothing attached.
@@ -200,5 +201,111 @@ func TestMustJSONEscapesWhatItEmbeds(t *testing.T) {
 	got := mustJSON(`a "quoted" thing`)
 	if got != `"a \"quoted\" thing"` {
 		t.Errorf("mustJSON = %s, want the quotes escaped", got)
+	}
+}
+
+// requestEvent builds a buffered event shaped the way the extension forwards one:
+// the raw CDP frame, method at the top level, params carrying the nested request.
+func requestEvent(method, url, verb, postData string) cdp.BufferedEvent {
+	params := map[string]any{
+		"requestId": "1000.1",
+		"type":      "Fetch",
+		"request": map[string]any{
+			"url":      url,
+			"method":   verb,
+			"postData": postData,
+		},
+	}
+	raw, _ := json.Marshal(params)
+	return cdp.BufferedEvent{Method: method, Params: raw}
+}
+
+// TestParseRequestsReadsTheNestedRequest pins the shape that makes this endpoint
+// worth having.
+//
+// `Network.requestWillBeSent` puts the URL and the POST body under `request`, not
+// at the top level. Getting that wrong yields an empty list, which looks exactly
+// like a page that made no requests — the one failure mode this endpoint exists to
+// rule out. So the shape is asserted against a realistic event rather than trusted.
+func TestParseRequestsReadsTheNestedRequest(t *testing.T) {
+	events := []cdp.BufferedEvent{
+		requestEvent("Network.requestWillBeSent",
+			"https://labs.google/fx/api/trpc/flow.upscale", "POST", `{"json":{"mediaId":"abc"}}`),
+	}
+
+	got := parseRequests(events, "", "")
+	if len(got) != 1 {
+		t.Fatalf("got %d requests, want 1 — the nested request was not read", len(got))
+	}
+	if got[0].URL != "https://labs.google/fx/api/trpc/flow.upscale" {
+		t.Errorf("url = %q", got[0].URL)
+	}
+	if got[0].Method != "POST" {
+		t.Errorf("method = %q, want POST", got[0].Method)
+	}
+	if got[0].Body != `{"json":{"mediaId":"abc"}}` {
+		t.Errorf("body = %q, want the postData", got[0].Body)
+	}
+	if !got[0].HasBody {
+		t.Error("a request with postData must report has_body")
+	}
+}
+
+// TestParseRequestsKeepsOnlyRealRequests covers the rest of the stream: every
+// other CDP event, a request with no URL, and a malformed frame all have to be
+// skipped rather than emitted as blanks.
+func TestParseRequestsKeepsOnlyRealRequests(t *testing.T) {
+	events := []cdp.BufferedEvent{
+		{Method: "Network.responseReceived", Params: json.RawMessage(`{"response":{"url":"https://x/y"}}`)},
+		{Method: "Page.loadEventFired", Params: json.RawMessage(`{"timestamp":1}`)},
+		{Method: "Network.requestWillBeSent", Params: json.RawMessage(`{"request":{"method":"GET"}}`)},
+		{Method: "Network.requestWillBeSent", Params: json.RawMessage(`not json`)},
+		requestEvent("Network.requestWillBeSent", "https://labs.google/fx/api/trpc/flow.list", "GET", ""),
+	}
+
+	got := parseRequests(events, "", "")
+	if len(got) != 1 {
+		t.Fatalf("got %d requests, want only the one with a URL", len(got))
+	}
+	if got[0].HasBody {
+		t.Error("a GET with no postData must report has_body=false")
+	}
+}
+
+func TestParseRequestsFilters(t *testing.T) {
+	events := []cdp.BufferedEvent{
+		requestEvent("Network.requestWillBeSent", "https://labs.google/fx/api/trpc/flow.upscale", "POST", `{}`),
+		requestEvent("Network.requestWillBeSent", "https://labs.google/fx/api/trpc/flow.list", "POST", `{}`),
+		requestEvent("Network.requestWillBeSent", "https://accounts.google.com/o/oauth2", "GET", ""),
+	}
+
+	for _, tc := range []struct {
+		name   string
+		filter string
+		method string
+		want   int
+	}{
+		{"no filter keeps everything", "", "", 3},
+		{"filter matches a substring anywhere", "upscale", "", 1},
+		{"filter is a substring, not a prefix", "labs.google", "", 2},
+		{"method narrows to one verb", "", "GET", 1},
+		{"method is case-insensitive", "", "get", 1},
+		{"filter and method together", "labs.google", "POST", 2},
+		{"a filter matching nothing yields an empty list", "nope", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseRequests(events, tc.filter, tc.method)
+			if len(got) != tc.want {
+				t.Errorf("got %d requests, want %d", len(got), tc.want)
+			}
+		})
+	}
+}
+
+// TestParseRequestsReturnsAnEmptySliceNotNull keeps the JSON honest: a nil slice
+// encodes as `null`, and a client reading `requests` expects an array.
+func TestParseRequestsReturnsAnEmptySliceNotNull(t *testing.T) {
+	if got := parseRequests(nil, "", ""); got == nil {
+		t.Error("no events must still produce an empty slice, not nil")
 	}
 }

@@ -32,10 +32,16 @@ import (
 )
 
 func main() {
-	// 9222 is the extension's own default, so this works with nothing configured
-	// in the browser. Pass a different -ws when the Flow engine is also running,
-	// since it holds that port.
-	wsAddr := flag.String("ws", "127.0.0.1:9222", "address the extension dials")
+	// 9223, not the extension's 9222 default, because this tool is meant to run
+	// *alongside* a product that also drives the same extension. Both listen for
+	// a WebSocket and both extensions dial 9222 by default, so sharing the port
+	// means whichever connects first wins and the other silently gets the wrong
+	// bridge — with errors that name the missing operation rather than the port.
+	//
+	// Keeping this one off 9222 makes the two coexist. Point the extension you use
+	// for debugging at this address (one line in its config.js) and leave the
+	// other where it is.
+	wsAddr := flag.String("ws", "127.0.0.1:9223", "address the extension dials")
 	httpAddr := flag.String("http", "127.0.0.1:8201", "address this API listens on")
 	dataDir := flag.String("data", "", "where to keep the pairing token (default: a temp dir)")
 	targets := flag.String("targets", defaultTargets, "comma-separated URLs the extension may attach to")
@@ -314,6 +320,58 @@ func (s *server) events(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "events": out})
 }
 
+// networkRequest is one request the page made, with the two fields that matter.
+type networkRequest struct {
+	Method  string `json:"method"`
+	URL     string `json:"url"`
+	Body    string `json:"body,omitempty"`
+	HasBody bool   `json:"has_body"`
+}
+
+// parseRequests pulls the requests out of a CDP event stream.
+//
+// Separate from the handler so it can be tested against a captured event, which is
+// the only way to pin the shape: `Network.requestWillBeSent` nests the URL and the
+// POST body under `request`, and a mistake there produces an empty list rather than
+// an error — indistinguishable from a page that made no requests, which is exactly
+// the confusion this endpoint exists to remove.
+func parseRequests(events []cdp.BufferedEvent, filter, method string) []networkRequest {
+	method = strings.ToUpper(method)
+	out := []networkRequest{}
+
+	for _, ev := range events {
+		if ev.Method != "Network.requestWillBeSent" {
+			continue
+		}
+		var payload struct {
+			Request struct {
+				URL      string `json:"url"`
+				Method   string `json:"method"`
+				PostData string `json:"postData"`
+			} `json:"request"`
+		}
+		if err := json.Unmarshal(ev.Params, &payload); err != nil {
+			continue
+		}
+		if payload.Request.URL == "" {
+			continue
+		}
+		if filter != "" && !strings.Contains(payload.Request.URL, filter) {
+			continue
+		}
+		if method != "" && strings.ToUpper(payload.Request.Method) != method {
+			continue
+		}
+		out = append(out, networkRequest{
+			Method:  payload.Request.Method,
+			URL:     payload.Request.URL,
+			Body:    payload.Request.PostData,
+			HasBody: payload.Request.PostData != "",
+		})
+	}
+	return out
+}
+
 // requests returns the network requests the page has made, parsed.
 //
 // This is the endpoint the tool is really for. Reading a request shape off the app
@@ -338,47 +396,7 @@ func (s *server) requests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter := r.URL.Query().Get("filter")
-	method := strings.ToUpper(r.URL.Query().Get("method"))
-
-	type request struct {
-		Method  string `json:"method"`
-		URL     string `json:"url"`
-		Body    string `json:"body,omitempty"`
-		HasBody bool   `json:"has_body"`
-	}
-
-	out := []request{}
-	for _, ev := range events {
-		if ev.Method != "Network.requestWillBeSent" {
-			continue
-		}
-		var payload struct {
-			Request struct {
-				URL      string `json:"url"`
-				Method   string `json:"method"`
-				PostData string `json:"postData"`
-			} `json:"request"`
-		}
-		if err := json.Unmarshal(ev.Params, &payload); err != nil {
-			continue
-		}
-		if payload.Request.URL == "" {
-			continue
-		}
-		if filter != "" && !strings.Contains(payload.Request.URL, filter) {
-			continue
-		}
-		if method != "" && payload.Request.Method != method {
-			continue
-		}
-		out = append(out, request{
-			Method:  payload.Request.Method,
-			URL:     payload.Request.URL,
-			Body:    payload.Request.PostData,
-			HasBody: payload.Request.PostData != "",
-		})
-	}
+	out := parseRequests(events, r.URL.Query().Get("filter"), r.URL.Query().Get("method"))
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "requests": out})
 }
 
@@ -440,8 +458,8 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	if client == nil || !client.Connected() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"attached": false,
-			"hint": "load ../extension in Chrome, then set its Backend bridge field to " +
-				"this tool's address",
+			"hint": "load ../extension in Chrome as an unpacked extension, and set " +
+				"bridgeUrl in its config.js to this tool's ws address",
 		})
 		return
 	}

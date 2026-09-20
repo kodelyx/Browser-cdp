@@ -1,4 +1,4 @@
-module github.com/kodelyx/cdp-control
+module github.com/kodelyx/Browser-cdp/cdp-control
 
 go 1.26.4
 

@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kodelyx/cdp-control/cdp"
-	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 )
 
 // DefaultBlockedMethods is the CDP deny-list pushed to every extension.

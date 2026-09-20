@@ -27,8 +27,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kodelyx/cdp-control/bridge"
-	"github.com/kodelyx/cdp-control/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
 )
 
 func main() {

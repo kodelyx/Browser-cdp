@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kodelyx/cdp-control/bridge"
-	"github.com/kodelyx/cdp-control/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
 )
 
 // newTestServer builds the API with a bridge and nothing attached.

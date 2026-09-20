@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 )
 
 // newTestBridge returns a bridge with no extension attached and no persisted

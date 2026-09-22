@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -137,7 +138,54 @@ func main() {
 		return nil
 	})
 
-	// 5. Mock HTTP API tests
+	// 5. Needle 3 reading the entire src/ codebase
+	runTest("Needle 3: Read & Vectorize All Code in src/", func() error {
+		eng, err := needle.GetNeedleEngine()
+		if err != nil {
+			return fmt.Errorf("failed to get needle engine: %w", err)
+		}
+
+		var files []string
+		err = filepath.Walk("src", func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if len(files) == 0 {
+			return fmt.Errorf("no source files found in src/")
+		}
+
+		readCount := 0
+		totalBytes := 0
+		for _, f := range files {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				return fmt.Errorf("failed to read %s: %w", f, err)
+			}
+			totalBytes += len(data)
+
+			// Needle 3 reads and embeds the code
+			emb, err := eng.Embed(string(data))
+			if err != nil {
+				return fmt.Errorf("Needle failed to embed %s: %w", f, err)
+			}
+			if len(emb) != 3072 {
+				return fmt.Errorf("expected 3072 dims for %s, got %d", f, len(emb))
+			}
+			readCount++
+		}
+		fmt.Printf("       ℹ️  Needle 3 read %d files (%d KB) into 3072-dim space\n", readCount, totalBytes/1024)
+		return nil
+	})
+
+	// 6. Mock HTTP API tests
 	runTest("HTTP API: Mock Endpoints & Security Checks", func() error {
 		tmpDir, err := os.MkdirTemp("", "cdp-http-test-*")
 		if err != nil {

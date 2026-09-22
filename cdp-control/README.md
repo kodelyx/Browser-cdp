@@ -15,7 +15,7 @@ nothing else attached, scoped to nothing in particular.
 
 ```bash
 go build -o cdp-control ./src
-go run test.go                      # run the complete test suite
+go test ./src/...                   # run the test suite
 ./cdp-control                       # ws 9223, http 8201
 ./cdp-control -ws 127.0.0.1:9222    # when nothing else holds it
 ./cdp-control -http 127.0.0.1:8301  # when 8201 is taken

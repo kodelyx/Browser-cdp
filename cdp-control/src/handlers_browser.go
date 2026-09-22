@@ -1,147 +1,22 @@
-// Command cdp-control drives a browser through the generic CDP extension, on its
-// own ports.
-//
-// It exists so debugging does not have to go through the Flow engine. Finding out
-// what the app actually sends means driving its UI and reading its network
-// traffic, and doing that from inside the product means every experiment runs
-// against the product's own bridge, its own scope and its own state. This is the
-// same extension on a separate port with nothing else attached.
-//
-//	ws   127.0.0.1:9223   the extension dials in here
-//	http 127.0.0.1:8201   this is what you talk to
-//
-// The Flow engine uses 9222 and 8200, so the two can run at once.
 package main
+
+// The endpoints that talk to the attached tab: what is attached, what is on
+// screen, and what the page sent over the wire.
+//
+// Every one of them is a thin translation between an HTTP request and one call
+// on the cdp client. The work — and the comments worth reading — lives in the cdp
+// package; this file is the surface a caller speaks to.
 
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
-	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/src/cdp"
 )
-
-func main() {
-	// 9223, not the extension's 9222 default, because this tool is meant to run
-	// *alongside* a product that also drives the same extension. Both listen for
-	// a WebSocket and both extensions dial 9222 by default, so sharing the port
-	// means whichever connects first wins and the other silently gets the wrong
-	// bridge — with errors that name the missing operation rather than the port.
-	//
-	// Keeping this one off 9222 makes the two coexist. Point the extension you use
-	// for debugging at this address (one line in its config.js) and leave the
-	// other where it is.
-	wsAddr := flag.String("ws", "127.0.0.1:9223", "address the extension dials")
-	httpAddr := flag.String("http", "127.0.0.1:8201", "address this API listens on")
-	dataDir := flag.String("data", "", "where to keep the pairing token (default: a temp dir)")
-	targets := flag.String("targets", defaultTargets, "comma-separated URLs the extension may attach to")
-	domains := flag.String("domains", defaultDomains, "comma-separated cookie scopes")
-	flag.Parse()
-
-	dir := *dataDir
-	if dir == "" {
-		dir = filepath.Join(os.TempDir(), "cdp-control")
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Fatalf("cdp-control: could not create %s: %v", dir, err)
-	}
-
-	br := bridge.NewBridge(splitList(*targets), splitList(*domains), dir)
-	br.ListenAddr = *wsAddr
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	go func() {
-		if err := br.Listen(ctx); err != nil && ctx.Err() == nil {
-			log.Fatalf("cdp-control: bridge stopped: %v", err)
-		}
-	}()
-
-	srv := &server{bridge: br}
-	mux := routes(srv)
-
-	httpSrv := &http.Server{Addr: *httpAddr, Handler: mux}
-	go func() {
-		log.Printf("cdp-control: API on http://%s", *httpAddr)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("cdp-control: http stopped: %v", err)
-		}
-	}()
-
-	<-ctx.Done()
-	log.Printf("cdp-control: shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
-}
-
-// routes wires the API. It is separate from main so a test can exercise the
-// handlers without starting a bridge or binding a port.
-func routes(srv *server) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", srv.health)
-	mux.HandleFunc("/status", srv.status)
-	mux.HandleFunc("/tabs", srv.tabs)
-	mux.HandleFunc("/eval", srv.eval)
-	mux.HandleFunc("/cdp", srv.cdp)
-	mux.HandleFunc("/click", srv.click)
-	mux.HandleFunc("/events", srv.events)
-	mux.HandleFunc("/requests", srv.requests)
-	mux.HandleFunc("/cookies", srv.cookies)
-	return mux
-}
-
-// The defaults are the hosts a Flow debugging session needs, so the tool is
-// useful with no flags at all.
-const (
-	defaultTargets = "https://labs.google/fx/tools/flow,https://flow.google.com"
-	defaultDomains = "labs.google,google.com,accounts.google.com"
-)
-
-func splitList(raw string) []string {
-	out := make([]string, 0, 4)
-	for _, part := range strings.Split(raw, ",") {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
-}
-
-type server struct {
-	bridge *bridge.Bridge
-}
-
-// client resolves the attached extension, or reports why there is none.
-func (s *server) client() (*cdp.Client, error) {
-	client := s.bridge.Current()
-	if client == nil || !client.Connected() {
-		return nil, fmt.Errorf("no extension attached — load ../extension in Chrome " +
-			"and point it at this bridge's address")
-	}
-	return client, nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("content-type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func writeErr(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{"error": err.Error()})
-}
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 	client := s.bridge.Current()
@@ -149,9 +24,39 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 	body := map[string]any{"attached": attached}
 	if attached {
 		body["addr"] = client.RemoteAddr
-		surface := client.ProbeSurface()
-		body["flow_operations"] = surface.FlowOperations
-		body["ops"] = surface.Advertised
+		body["ops"] = client.Ops()
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// status is the one call to make when something is not working.
+//
+// It answers, in one response, every question that otherwise takes three requests
+// to settle: is anything attached, which extension is it, what can it do, what is
+// it allowed to reach, and what is it currently sitting on.
+func (s *server) status(w http.ResponseWriter, r *http.Request) {
+	client := s.bridge.Current()
+	if client == nil || !client.Connected() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"attached": false,
+			"hint": "load ../extension in Chrome as an unpacked extension, and set " +
+				"bridgeUrl in its config.js to this tool's ws address",
+		})
+		return
+	}
+
+	body := map[string]any{
+		"attached":       true,
+		"addr":           client.RemoteAddr,
+		"ops":            client.Ops(),
+		"targets":        s.bridge.Targets,
+		"cookie_domains": s.bridge.CookieDomains,
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if tab, err := client.CurrentTab(ctx); err == nil && tab != nil {
+		body["tab"] = tab
 	}
 	writeJSON(w, http.StatusOK, body)
 }
@@ -245,6 +150,9 @@ func (s *server) cdp(w http.ResponseWriter, r *http.Request) {
 // Driving a UI by hand means locating a control, and the text on it is the one
 // thing that survives a redesign. It walks up from the text to the nearest
 // clickable ancestor, which is what a person does without thinking about it.
+//
+// The expression itself lives in agent.go, because the model's `click_element`
+// uses it too and the two must resolve elements identically.
 func (s *server) click(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Text  string `json:"text"`
@@ -267,17 +175,7 @@ func (s *server) click(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expr := fmt.Sprintf(`(() => {
-  const want = %s;
-  const all = [...document.querySelectorAll('button,a,[role=button],[role=menuitem],span,div')];
-  const hit = all.find(e => (e.innerText || '').trim() === want);
-  if (!hit) return {clicked: false, reason: 'no element with that exact text'};
-  const target = hit.closest('button,a,[role=button],[role=menuitem]') || hit;
-  target.click();
-  return {clicked: true, tag: target.tagName, label: (target.innerText || '').trim().slice(0, 60)};
-})()`, mustJSON(req.Text))
-
-	raw, err := client.Evaluate(ctx, expr)
+	raw, err := client.Evaluate(ctx, clickExpression(req.Text))
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
@@ -446,46 +344,4 @@ func (s *server) cookies(w http.ResponseWriter, r *http.Request) {
 		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "cookies": out})
-}
-
-// status is the one call to make when something is not working.
-//
-// It answers, in one response, every question that otherwise takes three requests
-// to settle: is anything attached, which extension is it, what can it do, what is
-// it allowed to reach, and what is it currently sitting on.
-func (s *server) status(w http.ResponseWriter, r *http.Request) {
-	client := s.bridge.Current()
-	if client == nil || !client.Connected() {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"attached": false,
-			"hint": "load ../extension in Chrome as an unpacked extension, and set " +
-				"bridgeUrl in its config.js to this tool's ws address",
-		})
-		return
-	}
-
-	surface := client.ProbeSurface()
-	body := map[string]any{
-		"attached":        true,
-		"addr":            client.RemoteAddr,
-		"flow_operations": surface.FlowOperations,
-		"ops":             surface.Advertised,
-		"targets":         s.bridge.Targets,
-		"cookie_domains":  s.bridge.CookieDomains,
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	if tab, err := client.CurrentTab(ctx); err == nil && tab != nil {
-		body["tab"] = tab
-	}
-	writeJSON(w, http.StatusOK, body)
-}
-
-func mustJSON(v any) string {
-	encoded, err := json.Marshal(v)
-	if err != nil {
-		return `""`
-	}
-	return string(encoded)
 }

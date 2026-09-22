@@ -13,16 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/src/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/src/cookiejar"
 )
 
 // DefaultBlockedMethods is the CDP deny-list pushed to every extension.
@@ -53,9 +51,12 @@ var DefaultBlockedMethods = []string{
 // Bridge owns the WebSocket the browser-Cdp extension dials into.
 type Bridge struct {
 	// Targets are the URLs the extension is allowed to attach to. The first
-	// entry is what it auto-opens when it has no tab.
+	// entry is what it auto-opens when it has no tab. Empty means every tab is
+	// attachable, which is the default for this tool.
 	Targets []string
-	// CookieDomains is the cookie scope handed to the extension.
+	// CookieDomains is the cookie scope handed to the extension. Empty means
+	// every domain is in scope; it also switches cookie mirroring off, since
+	// there is no declared site to mirror.
 	CookieDomains []string
 	// DataDir is where the bridge keeps its cookie file and its pairing token.
 	// It used to come from the surrounding application's config, which is what
@@ -236,27 +237,19 @@ func (b *Bridge) Listen(ctx context.Context) error {
 }
 
 func (b *Bridge) add(client *cdp.Client) {
-	// A Flow bridge beats a generic one, whatever the connection order.
+	// The most recent connection becomes `current`, which is what every call
+	// uses.
 	//
-	// Both can be attached at once, and `current` is what every ordinary call
-	// uses. Last-one-wins meant the purpose-built extension lost to a generic CDP
-	// bridge whenever the generic one happened to reconnect — not a decision
-	// anybody made, just an artefact of timing. The Flow extension exposes the
-	// narrow operations the backend wants; the generic one is the fallback, so it
-	// only takes `current` when nothing better is attached.
-	//
-	// The probe is outside the lock because it is a round trip. `hasFlowOps` pings
-	// once and caches the answer, so this costs one call per connection and
-	// nothing after that.
-	flow := client.ProbeSurface().FlowOperations
-
+	// Nothing distinguishes one extension from another any more: every call goes
+	// over the generic CDP surface in the cdp package, so no connection is
+	// better than another and there is no preference left to encode. Last-one-wins
+	// is the rule that needs no explanation, and the one a reader already
+	// assumes.
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	b.clients[client.RemoteAddr] = client
-	if flow || b.current == nil || !b.current.ProbeSurface().FlowOperations {
-		b.current = client
-	}
+	b.current = client
 }
 
 func (b *Bridge) remove(client *cdp.Client) {
@@ -268,17 +261,12 @@ func (b *Bridge) remove(client *cdp.Client) {
 		return
 	}
 
-	// Same preference on the way out: a Flow bridge if one is still attached,
-	// otherwise whatever is left.
+	// Promote whatever is left. There is no longer a better or worse extension to
+	// choose between, so any remaining connection will do.
 	b.current = nil
 	for _, other := range b.clients {
-		if other.ProbeSurface().FlowOperations {
-			b.current = other
-			return
-		}
-		if b.current == nil {
-			b.current = other
-		}
+		b.current = other
+		return
 	}
 }
 
@@ -312,20 +300,6 @@ func (b *Bridge) onConnect(ctx context.Context, client *cdp.Client) {
 	}
 	log.Printf("bridge: extension v%s ready", version)
 
-	// Say which surface this extension offers, because it decides the path every
-	// Flow call takes. The two extensions are not interchangeable: one exposes
-	// the backend's own narrow operations, the other only the generic evaluate
-	// fallback. Both work, so nothing looks wrong when the wrong one is loaded —
-	// the difference is what the browser is being asked to do, and how much
-	// surface is being shipped to it.
-	surface := client.ProbeSurface()
-	if surface.FlowOperations {
-		log.Printf("bridge: extension offers %d operations including the Flow surface — using the narrow calls",
-			len(surface.Advertised))
-	} else {
-		log.Printf("bridge: extension offers no Flow operations — falling back to the generic evaluate surface")
-	}
-
 	// If the tokenless window is still open, this extension has not adopted the
 	// token yet. Say so plainly: the bridge works, but it is not yet locked to
 	// this extension, and any local process could also connect.
@@ -342,40 +316,37 @@ func (b *Bridge) onConnect(ctx context.Context, client *cdp.Client) {
 		log.Printf("bridge: could not push config: %v", err)
 	}
 
+	// Cookie mirroring is off unless the caller named domains.
+	//
+	// The mirror exists so a backend can keep talking to a site after the browser
+	// closes. That is only meaningful when the caller declared which site, and
+	// syncing "every cookie in the browser" to disk is not something a debugging
+	// tool should do by default — a caller that wants a cookie reads it from the
+	// live browser through /cookies. Attempting it unscoped just produces a
+	// misleading "is the account signed in?" every time an extension connects.
+	if len(b.CookieDomains) == 0 {
+		log.Printf("bridge: no cookie domains configured — running unscoped, cookie mirroring off")
+		return
+	}
+
 	if _, err := b.SyncCookies(ctx, client); err != nil {
 		log.Printf("bridge: initial cookie sync failed: %v", err)
 	}
 }
 
-// PushConfig declares this project's allowlists to the extension.
+// PushConfig declares this project's scope to the extension.
 //
-// This is a permanent narrowing: the extension persists config in
-// chrome.storage.local, so it survives after flow-go disconnects. The applied
-// scope is therefore logged on every push, not only when it changes, so the
-// backend log always shows what the extension was told to do.
+// This is a permanent narrowing when a scope is set: the extension persists
+// config in chrome.storage.local, so it outlives this process. The applied scope
+// is therefore logged on every push, not only when it changes, so the log always
+// shows what the extension was told to do.
 func (b *Bridge) PushConfig(ctx context.Context, client *cdp.Client) error {
 	client = b.resolve(client)
 	if client == nil {
 		return fmt.Errorf("bridge: no extension connected")
 	}
 
-	// Let the extension open the target itself when nothing matches, so the
-	// engine can start before the browser and still work.
-	autoOpenCommand := true
-	autoOpenStart := true
-	focus := true
-
-	patch := cdp.Config{
-		TargetURLPrefixes: b.Targets,
-		CookieDomains:     b.CookieDomains,
-		BlockedMethods:    b.BlockedMethods,
-		BridgeToken:       b.token,
-		AutoOpenOnCommand: &autoOpenCommand,
-		AutoOpenOnStart:   &autoOpenStart,
-		FocusOnAutoOpen:   &focus,
-	}
-
-	applied, err := client.SetConfig(ctx, patch)
+	applied, err := client.SetConfig(ctx, b.configPatch())
 	if err != nil {
 		return err
 	}
@@ -386,6 +357,32 @@ func (b *Bridge) PushConfig(ctx context.Context, client *cdp.Client) error {
 	return nil
 }
 
+// configPatch is the scope this bridge declares to an extension.
+//
+// Separated from PushConfig so the declaration can be asserted without a browser
+// attached. What it contains is the difference between universal access and an
+// extension that quietly stayed narrowed, and that is not something to find out
+// from a live connection.
+func (b *Bridge) configPatch() cdp.Config {
+	// Let the extension open the target itself when nothing matches, so a backend
+	// can start before the browser and still work. With no scope declared there is
+	// no target to open, and the extension says so rather than opening something
+	// arbitrary.
+	autoOpenCommand := true
+	autoOpenStart := true
+	focus := true
+
+	return cdp.Config{
+		TargetURLPrefixes: orEmpty(b.Targets),
+		CookieDomains:     orEmpty(b.CookieDomains),
+		BlockedMethods:    b.BlockedMethods,
+		BridgeToken:       b.token,
+		AutoOpenOnCommand: &autoOpenCommand,
+		AutoOpenOnStart:   &autoOpenStart,
+		FocusOnAutoOpen:   &focus,
+	}
+}
+
 // tokenLabel describes a token without printing it.
 func tokenLabel(token string) string {
 	if token == "" {
@@ -394,9 +391,31 @@ func tokenLabel(token string) string {
 	return fmt.Sprintf("%d chars", len(token))
 }
 
+// orEmpty turns a nil slice into an empty one.
+//
+// `null` and `[]` are not the same thing on the wire. The extension reads an empty
+// allowlist as full access, and Go's zero value for a slice marshals as `null`,
+// which only reaches that behaviour by way of a `|| []` coercion on the far side.
+// Saying "no scope" explicitly is worth four lines: the caller's intent should be
+// visible in the bytes, not inferred from a language default.
+func orEmpty(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
 // SyncCookies pulls the scoped cookies from the browser, persists them, and
 // returns them as a jar. This is the only data the browser supplies.
 func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookiejar.Jar, error) {
+	// The scope is checked before the connection on purpose. "No cookie domains
+	// configured" is true whatever is attached, and it is the answer that says the
+	// feature is off rather than the answer that sends the caller off to attach an
+	// extension and come back to the same refusal.
+	if len(b.CookieDomains) == 0 {
+		return nil, fmt.Errorf("bridge: no cookie domains configured — cookie mirroring is off when unscoped")
+	}
+
 	client = b.resolve(client)
 	if client == nil {
 		return nil, fmt.Errorf("bridge: no extension connected")
@@ -425,10 +444,10 @@ func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookieja
 	converted := make([]cookiejar.Cookie, 0, len(seen))
 	skipped := 0
 	for _, ck := range seen {
-		// Only the cookies Flow depends on leave the browser. A signed-in profile
-		// carries hundreds for Mail, Drive, Play, NotebookLM and analytics, none
-		// of which have any bearing here — together they made a 19 kB Cookie
-		// header, and they were being written to disk for no reason.
+		// Only the cookies a session depends on leave the browser. A signed-in
+		// profile carries hundreds for Mail, Drive, Play, NotebookLM and
+		// analytics, none of which have any bearing here — together they made a
+		// 19 kB Cookie header, and they were being written to disk for no reason.
 		if !cookiejar.IsEssential(ck.Name) {
 			skipped++
 			continue
@@ -450,21 +469,12 @@ func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookieja
 
 	if len(converted) == 0 {
 		return nil, fmt.Errorf(
-			"bridge: none of the %d cookies the browser offered are ones Flow needs — is the account signed in?",
+			"bridge: none of the %d cookies the browser offered are ones a session needs — is the account signed in?",
 			len(seen))
 	}
 
-	// Name the jar after the bridge that actually supplied it.
-	//
-	// The label was the literal "browser-cdp" wherever a jar was built, so a run
-	// through the Flow extension still reported browser-cdp. It reads as
-	// information and is not, which is why it went unnoticed: every other field on
-	// that line was right, and the one that was wrong looked like a reading.
-	source := "browser-cdp"
-	if client.ProbeSurface().FlowOperations {
-		source = "flow-go-extension"
-	}
-	jar := cookiejar.FromCookies(converted, source)
+	// Name the jar after the bridge that supplied it.
+	jar := cookiejar.FromCookies(converted, "browser-cdp")
 
 	b.mu.Lock()
 	b.lastJar = jar
@@ -522,8 +532,8 @@ func (b *Bridge) Current() *cdp.Client {
 
 // Clients returns every attached extension, keyed by peer address.
 //
-// More than one can be connected at once — a second browser, or the generic
-// bridge alongside the Flow one — but only the most recent becomes `current`,
+// More than one can be connected at once — a second browser, or the same
+// extension pointed at two bridges — but only the most recent becomes `current`,
 // which is what every ordinary call uses. Reaching the others is what makes a
 // comparison possible without disconnecting one to look at the other, and a
 // comparison is the only way to tell "the browser does not have this" apart from
@@ -632,275 +642,6 @@ func (b *Bridge) RefreshSession(ctx context.Context) (*cookiejar.Jar, error) {
 	return jar, nil
 }
 
-// projectLinkExpression scrapes the project list from the Flow app landing page.
-// The list is rendered as ordinary anchors, so this needs no framework access.
-const projectLinkExpression = `(() => [...document.querySelectorAll('a[href*="/project/"]')]` +
-	`.map(a => a.href).slice(0, 40))()`
-
-// projectPathMarker identifies a Flow project editor URL.
-const projectPathMarker = "/project/"
-
-// urlMatchesAccount reports whether a Flow URL belongs to a signed-in account.
-//
-// Google addresses its accounts with a `/u/<n>/` path segment; a URL without one
-// is the first account. This is the same index the `authuser` query parameter
-// carries, which is why it is the only thing that distinguishes one account's
-// project from another's.
-func urlMatchesAccount(rawURL string, accountIndex int) bool {
-	const marker = "/u/"
-	i := strings.Index(rawURL, marker)
-	if i < 0 {
-		return accountIndex == 0
-	}
-	rest := rawURL[i+len(marker):]
-	j := strings.IndexByte(rest, '/')
-	if j < 0 {
-		return accountIndex == 0
-	}
-	n, err := strconv.Atoi(rest[:j])
-	if err != nil {
-		return accountIndex == 0
-	}
-	return n == accountIndex
-}
-
-// DiscoverProjects returns the project IDs visible on the currently attached tab.
-//
-// The Flow app landing page lists the account's projects, so this is how the
-// engine learns which project to generate into without the user pasting an ID.
-//
-// Links are filtered by account. The list is read out of the DOM, and until a
-// navigation completes the previous page's links are still there — so without
-// this filter a switch reads the account it just left and reports its project.
-func (b *Bridge) DiscoverProjects(ctx context.Context, accountIndex int) ([]string, error) {
-	client := b.Current()
-	if client == nil || !client.Connected() {
-		return nil, fmt.Errorf("bridge: no extension connected")
-	}
-
-	raw, err := client.FlowProjects(ctx, projectLinkExpression)
-	if err != nil {
-		return nil, fmt.Errorf("bridge: could not read the project list: %w", err)
-	}
-
-	var links []string
-	if err := json.Unmarshal(raw, &links); err != nil {
-		return nil, fmt.Errorf("bridge: the project list had an unexpected shape: %w", err)
-	}
-
-	seen := make(map[string]bool)
-	var ids []string
-	for _, link := range links {
-		if !urlMatchesAccount(link, accountIndex) {
-			continue
-		}
-		id := projectIDFromFlowURL(link)
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
-// EnsureProjectTab makes sure a Flow project editor tab is open and attached.
-//
-// This is not a convenience. The reCAPTCHA widget the generation call needs only
-// loads inside the editor; on the project list it is absent entirely, so a broker
-// evaluating there returns an empty token. Attaching to a project page is what
-// makes the broker path work.
-// EnsureProjectTab returns a tab sitting on a project editor for the given
-// signed-in account, opening one if necessary.
-//
-// accountIndex selects which of the browser's signed-in accounts the project has
-// to belong to. Projects are per-account, so this cannot be inferred from the
-// cookies — the accounts share one jar.
-func (b *Bridge) EnsureProjectTab(ctx context.Context, accountIndex int) (*cdp.Tab, error) {
-	client := b.Current()
-	if client == nil || !client.Connected() {
-		return nil, fmt.Errorf("bridge: no extension connected")
-	}
-
-	tabs, err := client.ListTabs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("bridge: could not list tabs: %w", err)
-	}
-
-	// Already on a project editor for this account: use it.
-	//
-	// The account matters, because a project belongs to one. A URL remembered
-	// from a different account does not open — it 404s — and the engine would
-	// then hold a project id its session cannot use.
-	for _, tab := range tabs {
-		if strings.Contains(tab.URL, projectPathMarker) && urlMatchesAccount(tab.URL, accountIndex) {
-			attached, attachErr := client.Attach(ctx, tab.ID)
-			if attachErr != nil {
-				return nil, attachErr
-			}
-			return &attached, nil
-		}
-	}
-
-	// Go to this account's own Flow home before reading the project list, so the
-	// ids discovered belong to the account the engine is acting as.
-	//
-	// This runs for account 0 too, not just the others: the shortcut above only
-	// accepts a tab already on *this* account's project, so reaching here means
-	// the page is showing something else, and its links are not an answer.
-	//
-	// Poll rather than pause: the list is rendered by the SPA, and a fixed wait
-	// that is long enough on an idle machine is too short on a busy one.
-	{
-		home := fmt.Sprintf("https://flow.google.com/u/%d/", accountIndex)
-
-		// Navigate the attached tab rather than opening another one. This runs on
-		// every account switch and every project change, so opening would leave a
-		// Flow tab behind each time until the browser hangs.
-		//
-		// Driven through location.href instead of a tabs API: that acts on
-		// whatever tab is already attached, so it needs no new extension surface
-		// and cannot accumulate anything.
-		if _, err := client.Attach(ctx, 0); err != nil {
-			return nil, fmt.Errorf("bridge: could not attach to a tab: %w", err)
-		}
-		if err := client.FlowNavigate(ctx, home, navigateExpression(home)); err != nil {
-			return nil, fmt.Errorf("bridge: could not open %s: %w", home, err)
-		}
-
-		// Wait for the navigation to land before reading anything. Until it does,
-		// the previous page is still in the DOM and its project links look like an
-		// answer — which is exactly how a switch reported the account it left.
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			cur, err := client.CurrentTab(ctx)
-			if err == nil && cur != nil && urlMatchesAccount(cur.URL, accountIndex) {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(500 * time.Millisecond):
-			}
-		}
-
-		// Then wait for the list itself to render.
-		for time.Now().Before(deadline) {
-			if ids, err := b.DiscoverProjects(ctx, accountIndex); err == nil && len(ids) > 0 {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Second):
-			}
-		}
-	}
-
-	// Otherwise find a project ID from the list, then open its editor.
-	ids, err := b.DiscoverProjects(ctx, accountIndex)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, fmt.Errorf(
-			"bridge: no Flow project found. Open a project in the browser once, or set " +
-				"FLOW_PROJECT_ID explicitly")
-	}
-
-	// The account is in the path, because the same project id under a different
-	// account is a 404 — which is exactly what an unqualified URL produced.
-	target := fmt.Sprintf("https://flow.google.com/u/%d%s%s", accountIndex, projectPathMarker, ids[0])
-	log.Printf("bridge: opening the Flow editor for project %s as account %d", ids[0], accountIndex)
-
-	// Same reasoning as the account home above: reuse the tab, do not add one.
-	if err := client.FlowNavigate(ctx, target, navigateExpression(target)); err != nil {
-		return nil, fmt.Errorf("bridge: could not open %s: %w", target, err)
-	}
-
-	// The editor is a heavy SPA; give it a moment to boot before anything tries
-	// to run script in it.
-	select {
-	case <-time.After(5 * time.Second):
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	// Prefer the live tab once it has actually landed, so the caller gets the
-	// settled URL. Otherwise report the target: re-querying can still show the
-	// previous page while the SPA boots, and the caller reads the project id off
-	// this URL, so the known target is the trustworthy answer.
-	if current, err := client.CurrentTab(ctx); err == nil && current != nil &&
-		strings.Contains(current.URL, projectPathMarker) && urlMatchesAccount(current.URL, accountIndex) {
-		return current, nil
-	}
-	if current, err := client.CurrentTab(ctx); err == nil && current != nil {
-		return &cdp.Tab{ID: current.ID, URL: target, Title: current.Title}, nil
-	}
-	return &cdp.Tab{URL: target}, nil
-}
-
-// navigateExpression points the current page at a URL.
-//
-// A page-level navigation rather than a tabs API, deliberately: it acts on
-// whatever tab is already attached, so a caller that navigates repeatedly cannot
-// accumulate tabs — and there is no new extension surface to keep in step.
-func navigateExpression(rawURL string) string {
-	return fmt.Sprintf("(() => { location.href = %s; return 'nav'; })()", strconv.Quote(rawURL))
-}
-
-// Fingerprint is the browser's own request identity.
-//
-// It matters because the reCAPTCHA assessment is tied to the client that
-// produced it. If the generation request then goes out under a different
-// user-agent or sec-ch-ua, the assessment does not line up with the request and
-// the upstream answers 403 PUBLIC_ERROR_UNUSUAL_ACTIVITY — a rejection that looks
-// like a captcha failure but is really a fingerprint mismatch.
-type Fingerprint struct {
-	UserAgent    string `json:"userAgent"`
-	Language     string `json:"language"`
-	Brands       string `json:"brands"`
-	Platform     string `json:"platform"`
-	Mobile       string `json:"mobile"`
-	PlatformFull string `json:"platformFull"`
-}
-
-// fingerprintExpression reads the identity the browser would send.
-const fingerprintExpression = `(() => {
-  const d = navigator.userAgentData || {};
-  const brands = (d.brands || []).map(b => '"' + b.brand + '";v="' + b.version + '"').join(', ');
-  return {
-    userAgent: navigator.userAgent,
-    language: navigator.language || 'en-US',
-    brands,
-    platform: d.platform || '',
-    mobile: d.mobile ? '?1' : '?0',
-    platformFull: '"' + (d.platform || 'macOS') + '"',
-  };
-})()`
-
-// Fingerprint reads the browser's request identity from the attached tab.
-func (b *Bridge) Fingerprint(ctx context.Context) (*Fingerprint, error) {
-	client := b.Current()
-	if client == nil || !client.Connected() {
-		return nil, fmt.Errorf("bridge: no extension connected")
-	}
-
-	raw, err := client.FlowFingerprint(ctx, fingerprintExpression)
-	if err != nil {
-		return nil, fmt.Errorf("bridge: could not read the browser fingerprint: %w", err)
-	}
-
-	var fp Fingerprint
-	if err := json.Unmarshal(raw, &fp); err != nil {
-		return nil, fmt.Errorf("bridge: the fingerprint had an unexpected shape: %w", err)
-	}
-	if fp.UserAgent == "" {
-		return nil, fmt.Errorf("bridge: the browser reported an empty user agent")
-	}
-	return &fp, nil
-}
-
 // Status is a JSON-friendly snapshot for the /health endpoint.
 type Status struct {
 	Connected      bool     `json:"extension_connected"`
@@ -911,12 +652,10 @@ type Status struct {
 	Targets        []string `json:"targets"`
 	CookieDomains  []string `json:"cookie_domains"`
 
-	// FlowOperations reports whether the attached extension offers the backend's
-	// own narrow operations rather than only the generic evaluate fallback, and
-	// ExtensionOps lists what it advertised. Both are empty until the extension
-	// has been asked, which happens on connect.
-	FlowOperations bool     `json:"flow_operations"`
-	ExtensionOps   []string `json:"extension_ops,omitempty"`
+	// ExtensionOps lists the operations the attached extension advertises. It is
+	// empty until the extension has been asked, which happens on the first status
+	// call and is cached after that.
+	ExtensionOps []string `json:"extension_ops,omitempty"`
 }
 
 // Status reports the current bridge state.
@@ -929,9 +668,7 @@ func (b *Bridge) Status() Status {
 		if v, ok := client.Version.Load().(string); ok {
 			s.Version = v
 		}
-		surface := client.Surface()
-		s.FlowOperations = surface.FlowOperations
-		s.ExtensionOps = surface.Advertised
+		s.ExtensionOps = client.Ops()
 	}
 
 	if jar := b.Jar(); jar != nil {
@@ -955,37 +692,4 @@ func (b *Bridge) MarshalStatus() string {
 		return err.Error()
 	}
 	return string(data)
-}
-
-// projectIDFromFlowURL pulls a project id out of a Flow URL.
-//
-// It moved here from the application's auth package: the bridge needs it to read
-// the project off a page it is attached to, and reaching back into the application
-// for one string-splitting helper is what kept this package from standing alone.
-func projectIDFromFlowURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	for i, part := range parts {
-		if part == "project" && i+1 < len(parts) {
-			return sanitizeID(parts[i+1])
-		}
-	}
-	if len(parts) > 0 && strings.Contains(u.Path, "/flow/") {
-		return sanitizeID(parts[len(parts)-1])
-	}
-	return ""
-}
-
-func sanitizeID(value string) string {
-	var out strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			out.WriteRune(r)
-		}
-	}
-	return out.String()
 }

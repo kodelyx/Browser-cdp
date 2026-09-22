@@ -1,6 +1,7 @@
 package cdp
 
 import (
+	"encoding/json"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"strings"
@@ -202,5 +203,49 @@ func TestCookiesToHeader(t *testing.T) {
 	}
 	if got := CookiesToHeader(expired); got != "new=y" {
 		t.Errorf("CookiesToHeader = %q, want %q", got, "new=y")
+	}
+}
+
+// TestConfigNeverOmitsTheScopeKeys is the regression test for the `omitempty`
+// that used to sit on these two fields.
+//
+// The extension treats an empty allowlist as full access, but it *merges* a
+// pushed config over what it already has stored. So an omitted key does not mean
+// "no scope" — it means "leave whatever scope was there before", and an extension
+// that an earlier backend had narrowed would stay narrowed while the caller
+// believed they had universal access. The keys must always be on the wire.
+func TestConfigNeverOmitsTheScopeKeys(t *testing.T) {
+	encoded, err := json.Marshal(Config{TargetURLPrefixes: []string{}, CookieDomains: []string{}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var patch map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &patch); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, key := range []string{"targetUrlPrefixes", "cookieDomains"} {
+		raw, present := patch[key]
+		if !present {
+			t.Errorf("%s was omitted, so a previously stored scope would survive the push", key)
+			continue
+		}
+		if string(raw) != "[]" {
+			t.Errorf("%s = %s, want an explicit empty array", key, raw)
+		}
+	}
+}
+
+// TestConfigStillOmitsWhatItShouldLeaveAlone guards the other side of the same
+// decision: BridgeToken is delivered once and must not be blanked on every push,
+// so it keeps its omitempty.
+func TestConfigStillOmitsWhatItShouldLeaveAlone(t *testing.T) {
+	encoded, err := json.Marshal(Config{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), "bridgeToken") {
+		t.Errorf("an empty token must be omitted, not pushed as a blank: %s", encoded)
 	}
 }

@@ -2,10 +2,9 @@ package cdp
 
 // The generic bridge's surface: arbitrary DevTools access to the attached tab.
 //
-// These three are what a generic bridge offers and a Flow bridge deliberately
-// does not. They live in their own file so the escape hatch is one place to
-// read, audit or remove, rather than interleaved with the Flow operations that
-// replaced it.
+// These three are the whole of the escape hatch. They live in their own file so
+// the one place that ships an arbitrary expression to a user's browser is one
+// place to read, audit or remove.
 
 import (
 	"context"

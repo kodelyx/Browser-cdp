@@ -5,8 +5,9 @@
 // operations and receive events. Dial is provided for the opposite arrangement
 // (a backend that connects to something else) and for tests.
 //
-// It is deliberately independent of Flow: any project can import this package and
-// drive a signed-in Chrome tab without launching Chrome with a debugging port.
+// It is deliberately independent of any product: any project can import this
+// package and drive a signed-in Chrome tab without launching Chrome with a
+// debugging port.
 package cdp
 
 import (
@@ -64,10 +65,17 @@ type Tab struct {
 
 // Config mirrors ../browser-Cdp/config.js so a backend can push its own allowlists
 // at startup instead of asking the user to retype them.
+//
+// TargetURLPrefixes and CookieDomains deliberately carry no `omitempty`. The
+// extension treats an empty list as full access, but it *merges* a pushed patch
+// over what it has stored, so an omitted key leaves a previously persisted
+// narrowing in place. A universal backend that says nothing would silently keep
+// whatever an earlier scoped backend wrote. Sending `[]` explicitly is what makes
+// "no scope" mean no scope.
 type Config struct {
 	BridgeURL         string   `json:"bridgeUrl,omitempty"`
-	TargetURLPrefixes []string `json:"targetUrlPrefixes,omitempty"`
-	CookieDomains     []string `json:"cookieDomains,omitempty"`
+	TargetURLPrefixes []string `json:"targetUrlPrefixes"`
+	CookieDomains     []string `json:"cookieDomains"`
 	EnableDomains     []string `json:"enableDomains,omitempty"`
 	BlockedMethods    []string `json:"blockedMethods,omitempty"`
 	// BridgeToken is the shared secret the extension must present on the
@@ -126,20 +134,15 @@ type Client struct {
 	// RemoteAddr is the peer address, for logging.
 	RemoteAddr string
 
-	// flowOps caches whether this extension implements the flow.* operations.
-	// -1 unknown, 0 no, 1 yes.
-	//
-	// The two extensions are not interchangeable: the generic bridge exposes a
-	// raw CDP surface and no Flow operations, and the Flow bridge exposes the
-	// Flow operations and no raw surface. Probing once is how one backend talks
-	// to either without a flag day.
-	flowOps atomic.Int32
+	// opsProbed records whether this extension has been asked what it
+	// implements. The answer is cached in advertised, so reporting it costs one
+	// round trip per connection and nothing after that.
+	opsProbed atomic.Bool
 
 	// opsMu guards advertised, the operation list the extension returned from
-	// ping. It is kept so the surface in use can be reported rather than guessed
-	// at — which extension is attached decides the path every Flow call takes,
-	// and that is the first thing worth knowing when a deployment behaves
-	// differently from the one before it.
+	// ping. It is reported rather than inferred: which operations an extension
+	// offers is the first thing worth knowing when one behaves differently from
+	// the one before it.
 	opsMu      sync.Mutex
 	advertised []string
 }
@@ -157,7 +160,6 @@ func New(conn *websocket.Conn) *Client {
 	}
 	c.lastErr.Store("")
 	c.Version.Store("")
-	c.flowOps.Store(-1)
 	if conn != nil {
 		c.RemoteAddr = conn.RemoteAddr().String()
 		go c.readLoop(conn)
@@ -722,4 +724,45 @@ func CookiesToHeader(cookies []Cookie) string {
 		out += ck.Name + "=" + ck.Value
 	}
 	return out
+}
+
+/* ------------------------------------------------------------------ *
+ * Capability
+ * ------------------------------------------------------------------ */
+
+// Ops reports the operations the attached extension advertises, asking once and
+// caching the answer.
+//
+// This is the whole of what this backend knows about the far side. It names no
+// operation of its own and requires none: an extension answers `ping` with
+// whatever it implements, and every call site uses the generic CDP surface in
+// cdp.go. Reporting the list is what makes a deployment that behaves differently
+// from the one before it diagnosable in one request, instead of by watching how
+// some call happened to fail.
+//
+// A failed ping is cached as "nothing advertised" rather than retried on every
+// caller, because the callers are status endpoints and the connection is
+// re-established rather than repaired.
+func (c *Client) Ops() []string {
+	if !c.opsProbed.Load() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var out struct {
+			Ops []string `json:"ops"`
+		}
+		// The error is deliberately dropped: an extension that does not answer
+		// ping, or does not carry a list, advertises nothing, and that is the
+		// same answer either way.
+		_ = c.Call(ctx, "ping", nil, &out)
+
+		c.opsMu.Lock()
+		c.advertised = append([]string(nil), out.Ops...)
+		c.opsMu.Unlock()
+		c.opsProbed.Store(true)
+	}
+
+	c.opsMu.Lock()
+	defer c.opsMu.Unlock()
+	return append([]string(nil), c.advertised...)
 }

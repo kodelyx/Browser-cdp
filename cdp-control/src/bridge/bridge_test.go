@@ -2,11 +2,13 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/src/cookiejar"
 )
 
 // newTestBridge returns a bridge with no extension attached and no persisted
@@ -109,42 +111,55 @@ func TestRefreshCoalesceWindowIsShort(t *testing.T) {
 	}
 }
 
-// TestURLMatchesAccount pins the account test that keeps a project from being
-// reused across accounts.
+// TestUniversalBridgeDeclaresAnEmptyScope is the regression test for universal
+// mode.
 //
-// Projects belong to one account, so a URL remembered from another does not open
-// — it 404s — and the engine would then hold a project id its session cannot use.
-// Google addresses accounts with `/u/<n>/`, and a URL without one is the first.
-func TestURLMatchesAccount(t *testing.T) {
-	cases := []struct {
-		url   string
-		index int
-		want  bool
-	}{
-		{"https://flow.google.com/project/abc", 0, true},
-		{"https://flow.google.com/project/abc", 1, false},
-		{"https://flow.google.com/project/abc", 2, false},
+// A nil slice marshals as `null`, not `[]`. That only reaches the extension's
+// "empty means full access" behaviour by way of a `|| []` coercion on the far
+// side, which is a thin thread to hang the tool's default posture on. The patch
+// has to say what it means.
+func TestUniversalBridgeDeclaresAnEmptyScope(t *testing.T) {
+	// nil targets and nil domains: the zero value, which is what an unscoped
+	// bridge is built from.
+	br := NewBridge(nil, nil, t.TempDir())
 
-		{"https://flow.google.com/u/0/project/abc", 0, true},
-		{"https://flow.google.com/u/1/project/abc", 1, true},
-		{"https://flow.google.com/u/2/project/abc", 2, true},
-		{"https://flow.google.com/u/1/project/abc", 0, false},
-		{"https://flow.google.com/u/1/project/abc", 2, false},
-
-		{"https://flow.google.com/u/2/?pli=1", 2, true},
-		{"https://flow.google.com/u/2/?pli=1", 1, false},
-
-		// A malformed or trailing index must not be mistaken for account 0 when
-		// the caller asked for something else.
-		{"https://flow.google.com/u/x/project/abc", 1, false},
-		{"https://flow.google.com/u/", 1, false},
-		{"https://flow.google.com/", 0, true},
-		{"https://flow.google.com/", 2, false},
+	encoded, err := json.Marshal(br.configPatch())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
 
-	for _, tc := range cases {
-		if got := urlMatchesAccount(tc.url, tc.index); got != tc.want {
-			t.Errorf("urlMatchesAccount(%q, %d) = %v, want %v", tc.url, tc.index, got, tc.want)
+	var patch map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &patch); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, key := range []string{"targetUrlPrefixes", "cookieDomains"} {
+		raw, present := patch[key]
+		if !present {
+			t.Errorf("%s was omitted, so an extension would keep whatever scope it already had", key)
+			continue
 		}
+		if string(raw) != "[]" {
+			t.Errorf("%s = %s, want an explicit empty array so the extension reads it as full access", key, raw)
+		}
+	}
+}
+
+// TestUnscopedBridgeRefusesToMirrorCookies pins the other half of universal mode.
+//
+// The cookie mirror exists so a backend can keep working after the browser
+// closes, which is only meaningful when the caller named a site. Running it
+// unscoped means asking the browser for every cookie it holds, and reporting the
+// empty result as "is the account signed in?" — a misleading answer to a question
+// nobody asked.
+func TestUnscopedBridgeRefusesToMirrorCookies(t *testing.T) {
+	br := NewBridge(nil, nil, t.TempDir())
+
+	_, err := br.SyncCookies(context.Background(), nil)
+	if err == nil {
+		t.Fatal("want an error, got none")
+	}
+	if !strings.Contains(err.Error(), "no cookie domains configured") {
+		t.Errorf("err = %v, want it to name the real reason", err)
 	}
 }
